@@ -1,0 +1,49 @@
+# ---- Build output (Visual C++ / cl.exe)
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+*.res
+*.manifest
+*.tlog
+*.log
+*.tmp
+*.lastbuildstate
+*.iobj
+*.ipdb
+
+# ---- Installer output (Inno Setup)
+Output/
+Delquen_Setup.exe
+
+# ---- Visual Studio / editors
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+x64/
+x86/
+Debug/
+Release/
+build/
+out/
+ipch/
+CMakeFiles/
+
+# ---- Runtime data (lives in %APPDATA%\Delquen, never in the repo)
+config.ini
+history.csv
+sessions/
+debug.log
+
+# ---- OS files
+Thumbs.db
+desktop.ini
+.DS_Store
