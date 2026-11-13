@@ -4,7 +4,7 @@
 
 [Setup]
 AppName=Delquen
-AppVersion=1.0
+AppVersion=2.1.0
 AppPublisher=Delquen
 DefaultDirName={autopf}\Delquen
 DefaultGroupName=Delquen

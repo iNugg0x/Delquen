@@ -10,6 +10,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <evntrace.h>
@@ -36,6 +37,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "pdh.lib")
@@ -58,7 +60,7 @@ struct Cfg {
     int rate = 500;       // ms
     int hkT = VK_F10, hkE = VK_F9;   // LOBYTE = tecla, HIBYTE = HOTKEYF_*
     bool trayClose = true, autostart = false;
-    bool enabled = true, autoShow = false, asked = false, lock = false, record = true, windowed = false;   // lock = cliques atravessam o overlay
+    bool enabled = true, autoShow = true, asked = false, lock = false, record = true, windowed = false, strict = false;   // lock = cliques atravessam o overlay
     int theme = 0;        // 0 sistema, 1 claro, 2 escuro
     int lang = -1;        // índice do idioma (-1 = detetar pelo Windows)
 };
@@ -151,8 +153,8 @@ static void LoadCfg() {
     C.hkT = GI(L"hkToggle", DEF.hkT); C.hkE = GI(L"hkEdit", DEF.hkE);
     C.trayClose = GI(L"trayClose", 1) != 0;
     C.autostart = GI(L"autostart", 0) != 0;
-    C.enabled = GI(L"enabled", 1) != 0; C.autoShow = GI(L"autoShow", 0) != 0;
-    C.asked = GI(L"asked", 0) != 0; C.lock = GI(L"lock", 0) != 0; C.record = GI(L"record", 1) != 0; C.windowed = GI(L"windowed", 0) != 0;
+    C.enabled = GI(L"enabled", 1) != 0; C.autoShow = GI(L"autoShow", 1) != 0;
+    C.asked = GI(L"asked", 0) != 0; C.lock = GI(L"lock", 0) != 0; C.record = GI(L"record", 1) != 0; C.windowed = GI(L"windowed", 0) != 0; C.strict = GI(L"strict", 0) != 0;
     C.theme = std::clamp(GI(L"theme", 0), 0, 2);
     int lg = GI(L"language", -1);
     C.lang = (lg >= 0 && lg < NLANG) ? lg : DetectLang();
@@ -164,7 +166,7 @@ static void SaveCfg() {
     SI(L"hkToggle", C.hkT); SI(L"hkEdit", C.hkE);
     SI(L"trayClose", C.trayClose); SI(L"autostart", C.autostart);
     SI(L"enabled", C.enabled); SI(L"autoShow", C.autoShow); SI(L"asked", C.asked); SI(L"lock", C.lock);
-    SI(L"record", C.record); SI(L"windowed", C.windowed); SI(L"theme", C.theme); SI(L"language", C.lang);
+    SI(L"record", C.record); SI(L"windowed", C.windowed); SI(L"strict", C.strict); SI(L"theme", C.theme); SI(L"language", C.lang);
     SaveSubset(g_profName.empty() ? L"overlay" : ProfSec(g_profName).c_str());   // com perfil ativo, grava no perfil
 }
 
@@ -188,39 +190,46 @@ static double g_qpcFreq = 1.0;
 
 static double NowSec() { LARGE_INTEGER n; QueryPerformanceCounter(&n); return n.QuadPart / g_qpcFreq; }
 
-// histograma de frame times da sessão (barras de 0,25 ms) - memória fixa
+// histograma de frame times (barras de 0,25 ms) - memória fixa; um para a sessão e outro para o benchmark
 static const int HBINS = 800;
-static DWORD g_histPid = 0;
-static int g_histSrc = 0;
-static unsigned long long g_hist[HBINS], g_histN = 0;
-static double g_histSum = 0;
-static float g_histMax = 0, g_histMin = 1e9f;
-static void HistReset() { memset(g_hist, 0, sizeof(g_hist)); g_histN = 0; g_histSum = 0; g_histMax = 0; g_histMin = 1e9f; }
-static void HistAdd(float ms) {   // chamar com g_mx bloqueado
-    int b = std::min((int)(ms * 4.0f), HBINS - 1);
-    g_hist[b]++; g_histN++; g_histSum += ms;
-    if (ms > g_histMax) g_histMax = ms;
-    if (ms < g_histMin) g_histMin = ms;
-}
 struct SessStats { double avg = 0, low1 = 0, low01 = 0, minFps = 0, maxFps = 0; unsigned long long n = 0; };
-static double HistLow(double frac) {
-    unsigned long long target = std::max<unsigned long long>(1, (unsigned long long)(g_histN * frac)), got = 0;
+struct Hist {
+    unsigned long long bins[HBINS] = {}, n = 0;
     double sum = 0;
-    for (int b = HBINS - 1; b >= 0 && got < target; --b) {
-        unsigned long long c = std::min(g_hist[b], target - got);
-        sum += c * ((b + 0.5) / 4.0); got += c;
+    float mx = 0, mn = 1e9f;
+    void reset() { memset(bins, 0, sizeof(bins)); n = 0; sum = 0; mx = 0; mn = 1e9f; }
+    void add(float ms) {
+        int b = std::min((int)(ms * 4.0f), HBINS - 1);
+        bins[b]++; ++n; sum += ms;
+        if (ms > mx) mx = ms;
+        if (ms < mn) mn = ms;
     }
-    return got ? 1000.0 / (sum / got) : 0;
-}
-static SessStats HistStats() {    // chamar com g_mx bloqueado
-    SessStats s; s.n = g_histN;
-    if (!g_histN || g_histSum <= 0) return s;
-    s.avg = 1000.0 * g_histN / g_histSum;
-    s.low1 = HistLow(0.01); s.low01 = HistLow(0.001);
-    s.minFps = g_histMax > 0 ? 1000.0 / g_histMax : 0;
-    s.maxFps = g_histMin < 1e8f ? 1000.0 / g_histMin : 0;
-    return s;
-}
+    double low(double frac) const {
+        unsigned long long target = std::max<unsigned long long>(1, (unsigned long long)(n * frac)), got = 0;
+        double s = 0;
+        for (int b = HBINS - 1; b >= 0 && got < target; --b) {
+            unsigned long long c = std::min(bins[b], target - got);
+            s += c * ((b + 0.5) / 4.0); got += c;
+        }
+        return got ? 1000.0 / (s / got) : 0;
+    }
+    SessStats stats() const {
+        SessStats r; r.n = n;
+        if (!n || sum <= 0) return r;
+        r.avg = 1000.0 * n / sum;
+        r.low1 = low(0.01); r.low01 = low(0.001);
+        r.minFps = mx > 0 ? 1000.0 / mx : 0;
+        r.maxFps = mn < 1e8f ? 1000.0 / mn : 0;
+        return r;
+    }
+};
+static Hist g_sh, g_bh;                          // sessão, benchmark (usar com g_mx bloqueado)
+static DWORD g_histPid = 0, g_benchPid = 0;
+static int g_histSrc = 0, g_benchSrc = 0;
+static void HistReset() { g_sh.reset(); }
+static SessStats HistStats() { return g_sh.stats(); }
+static void BenchReset() { g_bh.reset(); }
+static SessStats BenchStats() { return g_bh.stats(); }
 
 static void WINAPI OnEvent(PEVENT_RECORD ev) {
     USHORT id = ev->EventHeader.EventDescriptor.Id;
@@ -238,7 +247,8 @@ static void WINAPI OnEvent(PEVENT_RECORD ev) {
         float ms = float((ts - d.last[src]) * 1000.0 / g_qpcFreq);
         if (ms > 0.1f && ms < 2000.f) {
             d.fr[src].push_back({t, ms});
-            if (pid == g_histPid && src == g_histSrc) HistAdd(ms);
+            if (pid == g_histPid && src == g_histSrc) g_sh.add(ms);
+            if (pid == g_benchPid && src == g_benchSrc) g_bh.add(ms);
         }
         while (!d.fr[src].empty() && t - d.fr[src].front().t > 30.0) d.fr[src].pop_front();
     }
@@ -377,66 +387,102 @@ static void InitNvml() {
     if (!init || !hnd || !nvUtil || !nvTemp || !nvMem || init() != 0 || hnd(0, &nvDev) != 0) nvUtil = nullptr;
 }
 
-// GPU genérica (AMD/Intel/NVIDIA sem NVML): utilização 3D e VRAM via contadores do Windows + DXGI
-static std::wstring g_luid;          // "luid_0x........_0x........" (minúsculas) do adaptador principal
-static double g_vramTotalDxgi = 0;   // GB de memória dedicada do adaptador principal
+// GPU: utilização e VRAM por adaptador (contadores PDH + DXGI), temperatura via D3DKMT (qualquer fabricante),
+// temperatura da CPU pelas zonas térmicas do Windows (PDH)
+static void Log(const wchar_t* fmt, ...);
+
+struct Adapter { std::wstring key; LUID luid = {}; double vramTotal = 0; std::wstring name; };
+static std::vector<Adapter> g_adapters;     // todos os adaptadores gráficos (sem o "Microsoft Basic Render")
 
 static void InitDxgiAdapter() {
     IDXGIFactory1* fac = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&fac)) || !fac) return;
-    SIZE_T best = 0;
     IDXGIAdapter1* a = nullptr;
     for (UINT i = 0; fac->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 d;
-        if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.DedicatedVideoMemory >= best) {
-            best = d.DedicatedVideoMemory;
+        if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            Adapter ad;
             wchar_t b[64];
             swprintf_s(b, L"luid_0x%08x_0x%08x", (unsigned)d.AdapterLuid.HighPart, (unsigned)d.AdapterLuid.LowPart);
-            g_luid = b;
-            g_vramTotalDxgi = d.DedicatedVideoMemory / 1073741824.0;
+            ad.key = b; ad.luid = d.AdapterLuid; ad.vramTotal = d.DedicatedVideoMemory / 1073741824.0; ad.name = d.Description;
+            g_adapters.push_back(ad);
         }
         a->Release();
     }
     fac->Release();
+    for (auto& ad : g_adapters) Log(L"GPU: %ls | VRAM %.1f GB | %ls", ad.name.c_str(), ad.vramTotal, ad.key.c_str());
 }
 
-static PDH_HQUERY pq; static PDH_HCOUNTER pc, pcMem;
+static PDH_HQUERY pq; static PDH_HCOUNTER pcUtil, pcMem, pcTemp;
 static void PdhReopen() {
     if (pq) { PdhCloseQuery(pq); pq = nullptr; }
-    pc = pcMem = nullptr;
+    pcUtil = pcMem = pcTemp = nullptr;
     if (PdhOpenQueryW(nullptr, 0, &pq) != ERROR_SUCCESS) { pq = nullptr; return; }
-    if (PdhAddEnglishCounterW(pq, L"\\GPU Engine(*engtype_3D)\\Utilization Percentage", 0, &pc) != ERROR_SUCCESS) {
-        PdhCloseQuery(pq); pq = nullptr; pc = nullptr; return;
-    }
+    PdhAddEnglishCounterW(pq, L"\\GPU Engine(*engtype_3D)\\Utilization Percentage", 0, &pcUtil);
     PdhAddEnglishCounterW(pq, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &pcMem);
+    PdhAddEnglishCounterW(pq, L"\\Thermal Zone Information(*)\\Temperature", 0, &pcTemp);   // Kelvin
     PdhCollectQueryData(pq);
 }
-static double PdhSum(PDH_HCOUNTER c) {   // soma as instâncias do adaptador principal
-    if (!c) return -1;
+
+struct PdhItem { std::wstring name; double v; };
+static std::vector<PdhItem> PdhArray(PDH_HCOUNTER c) {   // todas as instâncias de um contador, nomes em minúsculas
+    std::vector<PdhItem> out;
+    if (!c) return out;
     DWORD sz = 0, cnt = 0;
-    if (PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE, &sz, &cnt, nullptr) != PDH_MORE_DATA || !sz) return -1;
+    if (PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE, &sz, &cnt, nullptr) != PDH_MORE_DATA || !sz) return out;
     std::vector<BYTE> b(sz);
     auto* it = (PDH_FMT_COUNTERVALUE_ITEM_W*)b.data();
-    if (PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE, &sz, &cnt, it) != ERROR_SUCCESS) return -1;
-    double t = 0;
+    if (PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE, &sz, &cnt, it) != ERROR_SUCCESS) return out;
     for (DWORD i = 0; i < cnt; ++i) {
-        if (!g_luid.empty()) {
-            std::wstring n = it[i].szName;
-            for (auto& ch : n) ch = (wchar_t)towlower(ch);
-            if (n.find(g_luid) == std::wstring::npos) continue;
-        }
-        t += it[i].FmtValue.doubleValue;
+        DWORD st = it[i].FmtValue.CStatus;
+        if (st != PDH_CSTATUS_VALID_DATA && st != PDH_CSTATUS_NEW_DATA) continue;
+        std::wstring n = it[i].szName;
+        for (auto& ch : n) ch = (wchar_t)towlower(ch);
+        out.push_back({n, it[i].FmtValue.doubleValue});
     }
-    return t;
+    return out;
+}
+static std::wstring LuidKey(const std::wstring& n) {   // "luid_0x00000000_0x0000abcd" dentro do nome da instância
+    size_t p = n.find(L"luid_0x");
+    return p == std::wstring::npos ? std::wstring() : n.substr(p, 26);
 }
 
-struct Hw { double cpu = 0, ramUsed = 0, ramTotal = 0; int gpu = -1, gpuTemp = -1; double vramUsed = 0, vramTotal = 0; };
+// temperatura da GPU pelo próprio Windows (D3DKMT_ADAPTER_PERFDATA, décimos de grau); funciona se o driver a expuser
+struct KmtOpen { LUID luid; UINT h; };
+struct KmtQuery { UINT h; UINT type; void* data; UINT size; };
+struct KmtClose { UINT h; };
+struct KmtPerf { UINT32 idx; ULONGLONG memFreq, maxMemFreq, maxMemFreqOC, memBandwidth, pcieBandwidth; ULONG fanRpm, power, temperature; UCHAR psOverride; };
+typedef LONG (WINAPI* PfnKmtOpen)(KmtOpen*);
+typedef LONG (WINAPI* PfnKmtQuery)(KmtQuery*);
+typedef LONG (WINAPI* PfnKmtClose)(KmtClose*);
+
+static int KmtTemp(const LUID& luid) {
+    static HMODULE g = LoadLibraryW(L"gdi32.dll");
+    static PfnKmtOpen op = g ? (PfnKmtOpen)GetProcAddress(g, "D3DKMTOpenAdapterFromLuid") : nullptr;
+    static PfnKmtQuery qu = g ? (PfnKmtQuery)GetProcAddress(g, "D3DKMTQueryAdapterInfo") : nullptr;
+    static PfnKmtClose cl = g ? (PfnKmtClose)GetProcAddress(g, "D3DKMTCloseAdapter") : nullptr;
+    if (!op || !qu || !cl || (!luid.LowPart && !luid.HighPart)) return -1;
+    KmtOpen o = {}; o.luid = luid;
+    if (op(&o) < 0) return -1;
+    KmtPerf pd = {};
+    KmtQuery q = {o.h, 62 /* KMTQAITYPE_ADAPTERPERFDATA */, &pd, (UINT)sizeof(pd)};
+    LONG st = qu(&q);
+    KmtClose c = {o.h};
+    cl(&c);
+    if (st < 0) return -1;
+    return (pd.temperature >= 100 && pd.temperature <= 1300) ? (int)((pd.temperature + 5) / 10) : -1;
+}
+
+struct Hw { double cpu = 0, ramUsed = 0, ramTotal = 0; int gpu = -1, gpuTemp = -1, cpuTemp = -1; double vramUsed = 0, vramTotal = 0; };
 static ULONGLONG FT(const FILETIME& f) { return ((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime; }
 
 static Hw PollHw() {
     static ULONGLONG pi = 0, pk = 0, pu = 0;
     static int k = 0;
-    static int lastGpu = -1; static double lastVram = 0;
+    static int lastGpu = -1, lastCpuT = -1, active = -1;
+    static double lastVram = 0, lastTotal = 0;
+    static LUID activeLuid = {};
+    static bool logged = false;
     Hw h;
     FILETIME i, kk, u;
     if (GetSystemTimes(&i, &kk, &u)) {
@@ -449,21 +495,60 @@ static Hw PollHw() {
     GlobalMemoryStatusEx(&ms);
     h.ramTotal = ms.ullTotalPhys / 1073741824.0;
     h.ramUsed = (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0;
-    if (nvUtil) {
+
+    if (nvUtil) {   // NVIDIA: NVML
         NvUtil u2; unsigned t = 0; NvMem m2;
         if (nvUtil(nvDev, &u2) == 0) h.gpu = (int)u2.gpu;
         if (nvTemp(nvDev, 0, &t) == 0) h.gpuTemp = (int)t;
         if (nvMem(nvDev, &m2) == 0) { h.vramUsed = m2.used / 1073741824.0; h.vramTotal = m2.total / 1073741824.0; }
-    } else if (C.gpu || C.vram) {
-        if (k++ % 10 == 0) PdhReopen();                  // reabre de 10 em 10 leituras (instâncias mudam); esta leitura usa o valor anterior
+    }
+
+    bool wantGpu = !nvUtil && (C.gpu || C.vram), wantCpuT = C.cpu && C.temps;
+    if (wantGpu || wantCpuT) {
+        if (k++ % 10 == 0) PdhReopen();          // reabre de 10 em 10 leituras (as instâncias mudam); esta leitura usa os valores anteriores
         else if (pq) {
             PdhCollectQueryData(pq);
-            double u3 = PdhSum(pc); if (u3 >= 0) lastGpu = (int)std::min(100.0, u3);
-            double v = PdhSum(pcMem); if (v >= 0) lastVram = v / 1073741824.0;
+            if (wantGpu) {
+                std::map<std::wstring, double> util, mem;
+                for (auto& it : PdhArray(pcUtil)) util[LuidKey(it.name)] += it.v;
+                for (auto& it : PdhArray(pcMem)) mem[LuidKey(it.name)] += it.v;
+                if (!g_adapters.empty()) {
+                    if (active < 0) {                // começa no adaptador com mais VRAM; depois segue o mais ocupado
+                        active = 0;
+                        for (size_t a = 1; a < g_adapters.size(); ++a) if (g_adapters[a].vramTotal > g_adapters[active].vramTotal) active = (int)a;
+                    }
+                    double best = 0.5; int bi = -1;
+                    for (size_t a = 0; a < g_adapters.size(); ++a) {
+                        auto f = util.find(g_adapters[a].key);
+                        if (f != util.end() && f->second > best) { best = f->second; bi = (int)a; }
+                    }
+                    if (bi >= 0) active = bi;
+                    const Adapter& ad = g_adapters[active];
+                    auto fu = util.find(ad.key);
+                    if (fu != util.end()) lastGpu = (int)std::min(100.0, fu->second + 0.5);
+                    auto fm = mem.find(ad.key);
+                    if (fm != mem.end()) lastVram = fm->second / 1073741824.0;
+                    lastTotal = ad.vramTotal; activeLuid = ad.luid;
+                    if (!logged && !util.empty()) { logged = true; Log(L"GPU ativa: %ls (%d adaptadores, %d instancias PDH)", ad.name.c_str(), (int)g_adapters.size(), (int)util.size()); }
+                } else {
+                    double sum = 0;
+                    for (auto& kv : util) sum += kv.second;
+                    lastGpu = (int)std::min(100.0, sum + 0.5);
+                }
+            }
+            if (wantCpuT) {
+                double best = -1;
+                for (auto& it : PdhArray(pcTemp)) { double c = it.v - 273.15; if (c > best && c > 15 && c < 120) best = c; }
+                if (best > 0) lastCpuT = (int)(best + 0.5);
+            }
         }
-        h.gpu = lastGpu;
-        if (g_vramTotalDxgi >= 0.5 && pcMem) { h.vramUsed = lastVram; h.vramTotal = g_vramTotalDxgi; }
     }
+    if (wantGpu) {
+        h.gpu = lastGpu;
+        if (lastTotal >= 0.5 && pcMem) { h.vramUsed = lastVram; h.vramTotal = lastTotal; }   // placas integradas partilham a RAM: sem VRAM
+        if (C.temps) h.gpuTemp = KmtTemp(activeLuid);
+    }
+    if (wantCpuT) h.cpuTemp = lastCpuT;
     return h;
 }
 
@@ -492,6 +577,12 @@ static void Log(const wchar_t* fmt, ...);   // %APPDATA%\Delquen\debug.log
 static Cfg g_stash;                // definições globais guardadas enquanto um perfil de jogo está ativo
 struct Session { bool active = false; FILE* f = nullptr; double t0 = 0, lastRow = 0; std::wstring exe, path; SYSTEMTIME st = {}; int rows = 0; };
 static Session g_sess;
+static bool g_benchOn = false;                   // benchmark manual (F8)
+static double g_benchT0 = 0, g_benchResUntil = 0;
+static std::wstring g_benchExe, g_benchRes;      // jogo medido e texto do último resultado
+static bool g_exclusive = false;                 // jogo em ecrã inteiro exclusivo: o overlay não pode aparecer por cima
+static void BenchToggle();
+static void BenchStop();
 static void SessionTick();
 static void SessionEnd();
 static void SyncUi();
@@ -546,6 +637,8 @@ static void Render() {
     int H = pad;
     if (C.fps) H += Sc(60);
     if (C.fps && C.lows && full) H += Sc(20);
+    const bool benchLine = g_benchOn || NowSec() < g_benchResUntil;
+    if (benchLine) H += Sc(20);
     if (C.compact) H += (C.cpu || C.gpu || C.ram) ? lineH : 0;
     else H += ((C.cpu ? 1 : 0) + (C.gpu ? 1 : 0) + (C.ram ? 1 : 0) + (showVram ? 1 : 0)) * lineH;
     if (C.graph && full) H += Sc(46);
@@ -581,13 +674,23 @@ static void Render() {
         }
     }
 
+    // ---- benchmark: "REC mm:ss" enquanto mede; depois o resultado durante uns segundos
+    if (benchLine) {
+        wchar_t bs[200];
+        if (g_benchOn) { int sec = (int)(NowSec() - g_benchT0); swprintf_s(bs, L"\u25CF REC  %02d:%02d", sec / 60, sec % 60); SetTextColor(m, Col(2)); }
+        else { wcsncpy_s(bs, g_benchRes.c_str(), _TRUNCATE); SetTextColor(m, Col(0)); }
+        SelectObject(m, fSm); T(m, pad, y - Sc(2), bs);
+        y += Sc(20);
+    }
+
     // ---- sensores
-    wchar_t cpuS[16], gpuS[16], ramS[40], vramS[40], gtS[16];
+    wchar_t cpuS[16], gpuS[16], ramS[40], vramS[40], gtS[16], ctS[16];
     swprintf_s(cpuS, L"%.0f%%", g_hw.cpu);
     if (g_hw.gpu >= 0) swprintf_s(gpuS, L"%d%%", g_hw.gpu); else wcscpy_s(gpuS, L"n/d");
     swprintf_s(ramS, L"%.1f / %.1f GB", g_hw.ramUsed, g_hw.ramTotal);
     swprintf_s(vramS, L"%.1f / %.1f GB", g_hw.vramUsed, g_hw.vramTotal);
     if (g_hw.gpuTemp >= 0) swprintf_s(gtS, L"%d\u00B0C", g_hw.gpuTemp); else gtS[0] = 0;
+    if (g_hw.cpuTemp >= 0) swprintf_s(ctS, L"%d\u00B0C", g_hw.cpuTemp); else ctS[0] = 0;
 
     if (C.compact) {
         if (C.cpu || C.gpu || C.ram) {
@@ -610,7 +713,7 @@ static void Render() {
             if (tmp && *tmp) { SetTextColor(m, tc); T(m, pad + Sc(150), y, tmp); }
             y += lineH;
         };
-        if (C.cpu) row(L"CPU", LoadCol((int)g_hw.cpu, Col(3)), cpuS, nullptr, 0);
+        if (C.cpu) row(L"CPU", LoadCol((int)g_hw.cpu, Col(3)), cpuS, C.temps ? ctS : nullptr, HeatCol(g_hw.cpuTemp));
         if (C.gpu) row(L"GPU", LoadCol(g_hw.gpu, Col(4)), gpuS, C.temps ? gtS : nullptr, HeatCol(g_hw.gpuTemp));
         if (C.ram) row(L"RAM", Col(5), ramS, nullptr, 0);
         if (showVram) row(L"VRAM", Col(5), vramS, nullptr, 0);
@@ -694,8 +797,8 @@ static HWND g_status;
 // ---- deteção de jogos: processo em primeiro plano que apresenta frames (exclui browsers, leitores, shell)
 static void OnGameChange(DWORD newPid);
 
-static std::map<DWORD, std::wstring> g_exeCache;
-static std::wstring ExeName(DWORD pid) {   // nome do .exe em minúsculas
+static std::map<DWORD, std::wstring> g_exeCache;   // pid -> caminho completo em minúsculas
+static std::wstring ExePath(DWORD pid) {
     auto it = g_exeCache.find(pid);
     if (it != g_exeCache.end()) return it->second;
     std::wstring s;
@@ -703,15 +806,23 @@ static std::wstring ExeName(DWORD pid) {   // nome do .exe em minúsculas
         wchar_t p[MAX_PATH]; DWORD n = MAX_PATH;
         if (QueryFullProcessImageNameW(h, 0, p, &n)) {
             s.assign(p, n);
-            size_t k = s.find_last_of(L'\\');
-            if (k != std::wstring::npos) s = s.substr(k + 1);
             for (auto& ch : s) ch = (wchar_t)towlower(ch);
         }
         CloseHandle(h);
     }
     if (g_exeCache.size() > 256) g_exeCache.clear();
-    g_exeCache[pid] = s;
+    if (!s.empty()) g_exeCache[pid] = s;                 // só guarda se resolveu (um processo a terminar pode falhar)
     return s;
+}
+static std::wstring ExeName(DWORD pid) {   // nome do .exe em minúsculas
+    std::wstring s = ExePath(pid);
+    size_t k = s.find_last_of(L'\\');
+    return k == std::wstring::npos ? s : s.substr(k + 1);
+}
+static std::wstring WindowClass(HWND w) {
+    wchar_t cn[96] = {};
+    if (w) GetClassNameW(w, cn, 96);
+    return cn;
 }
 
 static std::set<std::wstring> g_ignore;    // programas que o utilizador marcou como "não é um jogo"
@@ -731,11 +842,18 @@ static bool IsFullscreenLike(HWND w) {
     return r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
 }
 
-static bool IsExcluded(DWORD pid) {
-    if (pid == GetCurrentProcessId()) return true;
-    std::wstring s = ExeName(pid);
-    if (g_include.count(s)) return false;
-    if (g_ignore.count(s)) return true;
+// classes de janela do Windows e de navegadores/apps: nunca são jogos (um jogo tem a sua própria classe)
+static bool IsShellWindow(HWND w) {
+    std::wstring c = WindowClass(w);
+    static const wchar_t* shell[] = {
+        L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"CabinetWClass", L"ApplicationFrameWindow",
+        L"Windows.UI.Core.CoreWindow", L"XamlExplorerHostIslandWindow", L"MozillaWindowClass", L"Chrome_WidgetWin_0",
+        L"Chrome_WidgetWin_1", L"TaskManagerWindow", L"Notepad", L"#32770"};
+    for (auto* e : shell) if (c == e) return true;
+    return false;
+}
+
+static bool InSkipList(const std::wstring& s) {   // navegadores, launchers, leitores, apps de sistema...
     static const wchar_t* skip[] = {
         L"dwm.exe", L"explorer.exe", L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe",
         L"opera.exe", L"vivaldi.exe", L"msedgewebview2.exe", L"steamwebhelper.exe", L"discord.exe",
@@ -749,6 +867,24 @@ static bool IsExcluded(DWORD pid) {
         L"nvidia overlay.exe", L"msteams.exe", L"onedrive.exe", L"photos.exe", L"video.ui.exe", L"filmstv.exe"};
     for (auto* e : skip) if (s == e) return true;
     return false;
+}
+
+static bool InWindowsFolder(const std::wstring& lowerPath) {
+    wchar_t win[MAX_PATH]; UINT n = GetWindowsDirectoryW(win, MAX_PATH);
+    if (!n) return false;
+    std::wstring w(win, n);
+    for (auto& ch : w) ch = (wchar_t)towlower(ch);
+    return lowerPath.rfind(w + L"\\", 0) == 0;
+}
+
+static bool IsExcluded(DWORD pid) {
+    if (pid == GetCurrentProcessId()) return true;
+    std::wstring s = ExeName(pid);
+    if (s.empty()) return true;                       // processo desconhecido ou a terminar: nunca é um jogo
+    if (InWindowsFolder(ExePath(pid))) return true;     // Explorador, shell e apps de sistema nunca são jogos, nem com "é um jogo"
+    if (g_include.count(s)) return false;
+    if (g_ignore.count(s)) return true;
+    return InSkipList(s);
 }
 
 static int RecentFrames(DWORD pid, double win) {
@@ -772,7 +908,7 @@ static void UpdateHistSrc(DWORD pid) {   // fonte de frames usada no histograma 
     auto it = g_pids.find(pid);
     if (it == g_pids.end()) return;
     int s = PickSrc(it->second, NowSec());
-    if (s >= 0) g_histSrc = s;
+    if (s >= 0) { g_histSrc = s; if (g_benchOn) g_benchSrc = s; }
 }
 
 static std::wstring DiagText(DWORD pid) {   // eventos de frames recebidos nos últimos 2 s, por fonte
@@ -820,9 +956,17 @@ static void DetectGame(DWORD fg) {
         bool dead = !ProcAlive(g_gamePid);
         if (dead || now - LastSeen(g_gamePid) > 5.0) { Log(L"jogo %lu terminou (%ls)", g_gamePid, dead ? L"processo fechado" : L"sem frames"); g_gamePid = 0; }
     }
-    bool fgIsGame = fg && !IsExcluded(fg) && RecentFrames(fg, 2.0) >= 30 &&   // >= ~15 FPS
-                    (C.windowed || g_include.count(ExeName(fg)) || IsFullscreenLike(GetForegroundWindow()));
-    if (fgIsGame && fg != g_gamePid) g_gamePid = fg;
+    HWND fw = GetForegroundWindow();
+    bool incl = fg && g_include.count(ExeName(fg)) > 0;
+    bool fgIsGame;
+    if (C.strict)   // só jogos da biblioteca (funciona também em janela)
+        fgIsGame = incl && !IsExcluded(fg) && RecentFrames(fg, 2.0) >= 30;
+    else
+        fgIsGame = fg && !IsExcluded(fg) && (incl || !IsShellWindow(fw)) && RecentFrames(fg, 2.0) >= 30 &&   // >= ~15 FPS
+                   (C.windowed || incl || IsFullscreenLike(fw));
+    static DWORD candPid = 0; static double candSince = 0;                    // confirmação: 2 s seguidos a parecer um jogo
+    if (fgIsGame) { if (candPid != fg) { candPid = fg; candSince = now; } } else candPid = 0;
+    if (fgIsGame && fg != g_gamePid && now - candSince >= 2.0) g_gamePid = fg;
     if (g_gamePid != prev) OnGameChange(g_gamePid);                           // sessão + perfil do jogo
     bool active = g_gamePid != 0;
     if (active != g_gameActive) { g_gameActive = active; UpdateShown(); }
@@ -848,13 +992,24 @@ static void Tick() {
     DWORD pid = g_gamePid;                                  // só se mede um jogo detetado
     g_pid = pid;
     bool rec = g_sess.active;
-    if (rec) UpdateHistSrc(pid);
-    if (pid && (g_visible || mainVis || rec)) g_fps = ComputeFps(pid); else g_fps = FpsStats();
+    if (rec || g_benchOn) UpdateHistSrc(pid);
+    if (pid && (g_visible || mainVis || rec || g_benchOn)) g_fps = ComputeFps(pid); else g_fps = FpsStats();
     if ((g_visible || rec) && n % 2 == 0 && (C.cpu || C.gpu || C.ram || C.vram || rec)) g_hw = PollHw();
     if (++n % 40 == 0) Prune();
+    if (g_visible && n % 4 == 0)                            // alguns jogos repõem o seu próprio "sempre no topo": voltamos a pôr o overlay por cima
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    if (n % 4 == 0) {                                       // ecrã inteiro exclusivo (Direct3D)? o overlay não consegue aparecer por cima
+        bool ex = false;
+        if (g_gamePid) {
+            QUERY_USER_NOTIFICATION_STATE qs;
+            if (SUCCEEDED(SHQueryUserNotificationState(&qs)) && qs == QUNS_RUNNING_D3D_FULL_SCREEN) ex = true;
+        }
+        if (ex != g_exclusive) { g_exclusive = ex; Log(L"ecra inteiro exclusivo: %d", (int)ex); }
+    }
     if (mainVis && g_status) {
         wchar_t s[400];
-        if (g_fps.cur > 0) swprintf_s(s, L"%ls %.0f FPS - %ls (%ls)", TR(S_MEASURING), g_fps.cur, g_gameExe.c_str(),
+        if (g_exclusive && g_gamePid) wcsncpy_s(s, TR(S_STATUS_EXCLUSIVE), _TRUNCATE);
+        else if (g_fps.cur > 0) swprintf_s(s, L"%ls %.0f FPS - %ls (%ls)", TR(S_MEASURING), g_fps.cur, g_gameExe.c_str(),
                                       g_fps.src == 0 ? L"DirectX" : TR(S_SRC_OTHER));
         else if (g_enabled && C.autoShow && !g_gameActive) wcsncpy_s(s, TR(S_STATUS_AUTO), _TRUNCATE);
         else if (g_enabled && !C.autoShow) wcsncpy_s(s, TR(S_STATUS_MANUAL), _TRUNCATE);
@@ -1028,11 +1183,61 @@ static void MarkLastFg(bool isGame) {   // "é um jogo" / "não é um jogo" para
     }
 }
 
+static void ResetLists() {   // apaga as listas "é um jogo" / "não é um jogo"
+    WritePrivateProfileStringW(L"games", nullptr, nullptr, g_ini.c_str());
+    WritePrivateProfileStringW(L"ignore", nullptr, nullptr, g_ini.c_str());
+    g_include.clear(); g_ignore.clear();
+}
+
+static void BenchStop() {
+    if (!g_benchOn) return;
+    g_benchOn = false;
+    double dur = NowSec() - g_benchT0;
+    SessStats st;
+    { std::lock_guard<std::mutex> lk(g_mx); st = BenchStats(); g_benchPid = 0; }
+    wchar_t r[200];
+    if (st.n >= 30) swprintf_s(r, L"BENCH  %ls %.1f  |  1%% %.1f  |  0.1%% %.1f", TR(S_AVG), st.avg, st.low1, st.low01);
+    else wcscpy_s(r, L"BENCH  --");
+    g_benchRes = r;
+    g_benchResUntil = NowSec() + 12.0;                       // o overlay mostra o resultado durante 12 s
+    if (st.n >= 30) {
+        std::wstring bp = DataDir() + L"\\benchmarks.csv";
+        bool isNew = GetFileAttributesW(bp.c_str()) == INVALID_FILE_ATTRIBUTES;
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, bp.c_str(), L"a, ccs=UTF-8") == 0 && f) {
+            SYSTEMTIME t; GetLocalTime(&t);
+            if (isNew) fwprintf(f, L"date,time,exe,duration_s,avg_fps,fps_1pct_low,fps_0.1pct_low,min_fps,max_fps\n");
+            fwprintf(f, L"%04d-%02d-%02d,%02d:%02d:%02d,%ls,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f\n", t.wYear, t.wMonth, t.wDay,
+                     t.wHour, t.wMinute, t.wSecond, g_benchExe.c_str(), dur, st.avg, st.low1, st.low01, st.minFps, st.maxFps);
+            fclose(f);
+        }
+    }
+    Log(L"benchmark terminou: %ls", g_benchRes.c_str());
+    SyncUi();
+}
+
+static void BenchToggle() {   // F8 / botão: iniciar ou parar o benchmark do jogo atual
+    if (g_benchOn) { BenchStop(); return; }
+    if (!g_gamePid) { MessageBoxW(g_main, TR(S_MSG_NOGAME), L"Delquen", MB_ICONINFORMATION); return; }
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_benchPid = g_gamePid; g_benchSrc = 0;
+        auto it = g_pids.find(g_gamePid);
+        if (it != g_pids.end()) { int sc = PickSrc(it->second, NowSec()); if (sc >= 0) g_benchSrc = sc; }
+        BenchReset();
+    }
+    g_benchExe = g_gameExe; g_benchT0 = NowSec(); g_benchOn = true; g_benchRes.clear(); g_benchResUntil = 0;
+    Log(L"benchmark iniciou: %ls", g_gameExe.c_str());
+    SyncUi();
+}
+
 static void OnGameChange(DWORD newPid) {
     SessionEnd();
+    BenchStop();
     ProfileLeave();
     g_gameExe = newPid ? ExeName(newPid) : std::wstring();
-    Log(L"jogo atual: pid %lu %ls", newPid, g_gameExe.empty() ? L"(nenhum)" : g_gameExe.c_str());
+    Log(L"jogo atual: pid %lu %ls | classe %ls", newPid, g_gameExe.empty() ? L"(nenhum)" : g_gameExe.c_str(),
+        newPid ? WindowClass(GetForegroundWindow()).c_str() : L"-");
     if (newPid) { ProfileEnter(g_gameExe); SessionStart(newPid, g_gameExe); }
     SyncUi();
 }
@@ -1103,6 +1308,7 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         if (w == 1) SetVisible(!g_enabled);
         if (w == 2) SetLock(!C.lock);
         if (w == 3) PostQuitMessage(0);
+        if (w == 4) BenchToggle();
         return 0;
     case WM_NCHITTEST: return HTCAPTION;                    // arrastar em qualquer ponto (se não estiver bloqueado)
     case WM_NCLBUTTONDBLCLK: ShowMain(); return 0;          // duplo clique abre a janela principal
@@ -1142,7 +1348,8 @@ enum {
     IDC_HK_T = 1300, IDC_HK_E, IDC_HK_APPLY, IDC_TRAYCLOSE, IDC_AUTO, IDC_AUTOSHOW, IDC_INFO,
     IDC_RATE0 = 1310,                                           // 1310..1312
     IDC_THEME0 = 1320,                                          // 1320..1322
-    IDC_PROFILE = 1330, IDC_RECORD, IDC_OPENDIR, IDC_GAMENAME, IDC_HIST, IDC_IGNORE, IDC_WINDOWED, IDC_LASTFG, IDC_INCLUDE, IDC_LANG, IDC_DIAG
+    IDC_PROFILE = 1330, IDC_RECORD, IDC_OPENDIR, IDC_GAMENAME, IDC_HIST, IDC_IGNORE, IDC_WINDOWED, IDC_LASTFG, IDC_INCLUDE, IDC_LANG, IDC_DIAG, IDC_RESETLISTS,
+    IDC_STRICT, IDC_GAMELIST, IDC_LIBADD, IDC_LIBREMOVE, IDC_LIBSCAN, IDC_LIBCOUNT, IDC_LIBFOLDER, IDC_BENCH, IDC_BENCHRES
 };
 enum { K_PUSH = 0, K_TOGGLE, K_TAB, K_RADIO, K_CHECK };
 
@@ -1155,7 +1362,7 @@ static bool g_dark = false;
 static const Theme& TH() { return g_dark ? DARK : LIGHT; }
 static HBRUSH g_brBg, g_brPanel, g_brInput;
 
-static HWND g_pg[4];
+static HWND g_pg[5];
 static HFONT g_uiFont;
 static HBRUSH g_swBr[6];
 static int g_dpi = 96, g_tabSel = 0;
@@ -1204,16 +1411,16 @@ static void ApplyTheme() {
 
 static int BtnKind(int id) {
     if (id == IDC_ACTIVE) return K_TOGGLE;
-    if (id >= IDC_TAB0 && id < IDC_TAB0 + 4) return K_TAB;
+    if (id >= IDC_TAB0 && id < IDC_TAB0 + 5) return K_TAB;
     if (id == IDC_MODE_FULL || id == IDC_MODE_COMPACT || (id >= IDC_RATE0 && id < IDC_RATE0 + 3) ||
         (id >= IDC_THEME0 && id < IDC_THEME0 + 3)) return K_RADIO;
     if ((id >= IDC_SENS && id < IDC_SENS + NSENS) || id == IDC_TRAYCLOSE || id == IDC_AUTO || id == IDC_AUTOSHOW || id == IDC_LOCK ||
-        id == IDC_PROFILE || id == IDC_RECORD || id == IDC_WINDOWED) return K_CHECK;
+        id == IDC_PROFILE || id == IDC_RECORD || id == IDC_WINDOWED || id == IDC_STRICT) return K_CHECK;
     return K_PUSH;
 }
 static bool BtnState(int id) {
     if (id == IDC_ACTIVE) return g_enabled;
-    if (id >= IDC_TAB0 && id < IDC_TAB0 + 4) return g_tabSel == id - IDC_TAB0;
+    if (id >= IDC_TAB0 && id < IDC_TAB0 + 5) return g_tabSel == id - IDC_TAB0;
     if (id == IDC_MODE_FULL) return !C.compact;
     if (id == IDC_MODE_COMPACT) return C.compact;
     if (id >= IDC_SENS && id < IDC_SENS + NSENS) return *SENS[id - IDC_SENS].f;
@@ -1226,6 +1433,7 @@ static bool BtnState(int id) {
     if (id == IDC_PROFILE) return !g_profName.empty();
     if (id == IDC_RECORD) return C.record;
     if (id == IDC_WINDOWED) return C.windowed;
+    if (id == IDC_STRICT) return C.strict;
     return false;
 }
 
@@ -1313,15 +1521,25 @@ static void SetAutostart(bool on) {
 
 static void Apply() { SaveCfg(); if (g_visible) Render(); }
 
+static void RefreshLibrary() {   // lista de jogos (= lista "é um jogo" do config.ini)
+    if (!g_pg[4]) return;
+    HWND lb = Item(4, IDC_GAMELIST);
+    SendMessageW(lb, LB_RESETCONTENT, 0, 0);
+    for (auto& n : g_include) SendMessageW(lb, LB_ADDSTRING, 0, (LPARAM)n.c_str());
+    SetWindowTextW(Item(4, IDC_LIBCOUNT), std::to_wstring(g_include.size()).c_str());
+}
+
 static void RefreshGames() {   // página "Jogos": jogo atual e últimas sessões
     if (!g_pg[3]) return;
     std::wstring g = g_gameExe.empty() ? std::wstring(TR(S_NONE_OPEN)) : g_gameExe;
     if (!g_profName.empty()) { g += L"   "; g += TR(S_PROFILE_ACTIVE); }
     SetWindowTextW(Item(3, IDC_GAMENAME), g.c_str());
-    std::wstring lf = g_lastFg ? ExeName(g_lastFg) : std::wstring();
-    SetWindowTextW(Item(3, IDC_LASTFG), lf.empty() ? L"-" : lf.c_str());
+    if (g_pg[4]) {
+        std::wstring lf = g_lastFg ? ExeName(g_lastFg) : std::wstring();
+        SetWindowTextW(Item(4, IDC_LASTFG), lf.empty() ? L"-" : lf.c_str());
+    }
     if (g_tabSel == 3) {
-        std::wstring h = LastSessions(5);
+        std::wstring h = LastSessions(6);
         SetWindowTextW(Item(3, IDC_HIST), h.empty() ? TR(S_NO_SESSIONS) : h.c_str());
     }
 }
@@ -1336,8 +1554,9 @@ static void RefreshDiag() {   // diagnóstico: que eventos de frames chegam do j
 
 static void SelectTab(int i) {
     g_tabSel = i;
-    for (int k = 0; k < 4; ++k) ShowWindow(g_pg[k], k == i ? SW_SHOW : SW_HIDE);
+    for (int k = 0; k < 5; ++k) ShowWindow(g_pg[k], k == i ? SW_SHOW : SW_HIDE);
     if (i == 3) RefreshGames();
+    if (i == 4) { RefreshLibrary(); RefreshGames(); }
     InvalidateButtons();
 }
 
@@ -1363,7 +1582,12 @@ static void SyncUi() {
     info += nvUtil ? L"NVIDIA (NVML)" : pq ? TR(S_GPU_PDH) : TR(S_NOT_AVAILABLE);
     info += std::wstring(L"\r\nOpenGL/Vulkan: ") + (g_krnlOk ? TR(S_ACTIVE_EXP) : TR(S_NOT_AVAILABLE));
     SetWindowTextW(Item(2, IDC_INFO), info.c_str());
+    if (g_pg[3]) {
+        SetWindowTextW(Item(3, IDC_BENCH), g_benchOn ? TR(S_BENCH_STOP) : TR(S_BENCH_START));
+        SetWindowTextW(Item(3, IDC_BENCHRES), g_benchOn ? L"\u25CF REC" : g_benchRes.c_str());
+    }
     RefreshGames();
+    RefreshLibrary();
     g_sync = false;
     InvalidateButtons();
 }
@@ -1394,7 +1618,7 @@ static void PickColor(int i) {
 
 static LRESULT CALLBACK PageProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
-    case WM_COMMAND: case WM_HSCROLL: case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: case WM_DRAWITEM:
+    case WM_COMMAND: case WM_HSCROLL: case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: case WM_DRAWITEM:
         return SendMessageW(g_main, msg, w, l);
     case WM_ERASEBKGND: {
         RECT r; GetClientRect(h, &r);
@@ -1420,9 +1644,9 @@ static void BuildUi() {
     g_status = Mk(-1, L"STATIC", L"", SS_LEFT, 10, 50, 490, 18, IDC_STATUS);
 
     // separadores (botões desenhados à mão) + painéis
-    const wchar_t* names[] = {TR(S_TAB_OVERLAY), TR(S_TAB_SENSORS), TR(S_TAB_SETTINGS), TR(S_TAB_GAMES)};
-    for (int i = 0; i < 4; ++i) Bt(-1, names[i], 10 + i * 110, 74, 108, 28, IDC_TAB0 + i);
-    for (int i = 0; i < 4; ++i)
+    const wchar_t* names[] = {TR(S_TAB_OVERLAY), TR(S_TAB_SENSORS), TR(S_TAB_SETTINGS), TR(S_TAB_GAMES), TR(S_TAB_LIBRARY)};
+    for (int i = 0; i < 5; ++i) Bt(-1, names[i], 10 + i * 98, 74, 96, 28, IDC_TAB0 + i);
+    for (int i = 0; i < 5; ++i)
         g_pg[i] = CreateWindowExW(0, L"DelquenPage", L"", WS_CHILD | WS_CLIPCHILDREN | (i == 0 ? WS_VISIBLE : 0),
                                   D(10), D(102), D(490), D(346), g_main, nullptr, g_hi, nullptr);
 
@@ -1489,14 +1713,27 @@ static void BuildUi() {
     Bt(3, TR(S_PROFILE_CB), 10, 38, 450, 22, IDC_PROFILE);
     Bt(3, TR(S_RECORD_CB), 10, 64, 450, 22, IDC_RECORD);
     Bt(3, TR(S_WINDOWED_CB), 10, 90, 450, 22, IDC_WINDOWED);
-    Lbl(3, TR(S_LAST_FOCUS), 10, 124, 190);
-    Mk(3, L"STATIC", L"", SS_LEFT, 205, 127, 265, 18, IDC_LASTFG);
-    Bt(3, TR(S_IS_GAME), 10, 152, 220, 26, IDC_INCLUDE);
-    Bt(3, TR(S_NOT_GAME), 240, 152, 220, 26, IDC_IGNORE);
-    Bt(3, TR(S_OPEN_DATA), 10, 188, 200, 26, IDC_OPENDIR);
-    Mk(3, L"STATIC", L"", SS_LEFT, 220, 188, 250, 34, IDC_DIAG);
-    Lbl(3, TR(S_LAST_SESSIONS), 10, 226, 250);
-    Mk(3, L"STATIC", L"", SS_LEFT, 10, 250, 450, 88, IDC_HIST);
+    Bt(3, TR(S_OPEN_DATA), 10, 124, 200, 26, IDC_OPENDIR);
+    Mk(3, L"STATIC", L"", SS_LEFT, 220, 124, 250, 34, IDC_DIAG);
+    Bt(3, TR(S_BENCH_START), 10, 162, 220, 28, IDC_BENCH);
+    Mk(3, L"STATIC", L"", SS_LEFT, 240, 166, 230, 34, IDC_BENCHRES);
+    Lbl(3, TR(S_LAST_SESSIONS), 10, 204, 250);
+    Mk(3, L"STATIC", L"", SS_LEFT, 10, 228, 450, 110, IDC_HIST);
+
+    // ---- página 4: Biblioteca de jogos
+    Bt(4, TR(S_LIB_STRICT), 10, 10, 450, 22, IDC_STRICT);
+    Mk(4, L"LISTBOX", L"", WS_VSCROLL | LBS_NOTIFY | LBS_SORT | LBS_NOINTEGRALHEIGHT | WS_TABSTOP, 10, 38, 450, 118, IDC_GAMELIST, WS_EX_CLIENTEDGE);
+    Bt(4, TR(S_LIB_ADD), 10, 164, 130, 28, IDC_LIBADD);
+    Bt(4, TR(S_LIB_REMOVE), 148, 164, 110, 28, IDC_LIBREMOVE);
+    Bt(4, TR(S_LIB_SCAN), 266, 164, 194, 28, IDC_LIBSCAN);
+    Bt(4, TR(S_LIB_FOLDER), 10, 198, 220, 28, IDC_LIBFOLDER);
+    Bt(4, TR(S_RESET_LISTS), 240, 198, 220, 28, IDC_RESETLISTS);
+    Lbl(4, TR(S_LAST_FOCUS), 10, 236, 190);
+    Mk(4, L"STATIC", L"", SS_LEFT, 205, 239, 255, 18, IDC_LASTFG);
+    Bt(4, TR(S_IS_GAME), 10, 262, 220, 28, IDC_INCLUDE);
+    Bt(4, TR(S_NOT_GAME), 240, 262, 220, 28, IDC_IGNORE);
+    Lbl(4, TR(S_LIB_COUNT), 10, 308, 200);
+    Mk(4, L"STATIC", L"", SS_LEFT, 215, 311, 245, 18, IDC_LIBCOUNT);
 
     // botões inferiores
     Bt(-1, TR(S_RESET_DEFAULTS), 10, 458, 170, 28, IDC_RESET);
@@ -1563,14 +1800,366 @@ static void SetLang(int idx) {         // muda o idioma sem reiniciar: reconstr�
     RedrawWindow(g_main, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
+// ---------------- biblioteca: adicionar / remover / importar
+static bool AddGameName(std::wstring n) {
+    for (auto& ch : n) ch = (wchar_t)towlower(ch);
+    if (n.empty() || g_include.count(n)) return false;
+    g_include.insert(n);
+    SS(L"games", n.c_str(), 1);
+    if (g_ignore.erase(n)) WritePrivateProfileStringW(L"ignore", n.c_str(), nullptr, g_ini.c_str());
+    return true;
+}
+
+static bool JunkExe(const std::wstring& n) {   // executáveis que não são o jogo (instaladores, anti-cheat, lançadores...)
+    static const wchar_t* bad[] = {L"unins", L"crash", L"redist", L"setup", L"install", L"update", L"helper", L"report",
+        L"vc_", L"dotnet", L"launcher", L"easyanticheat", L"battleye", L"beservice", L"directx", L"dxsetup", L"prereq",
+        L"notification", L"bootstrap", L"cefprocess", L"service", L"uninstall", L"uninst", L"error", L"agent", L"svc", L"riotclient", L"unitycrash", L"eosoverlay", L"webhelper"};
+    for (auto* b : bad) if (n.find(b) != std::wstring::npos) return true;
+    return false;
+}
+
+static void ScanDir(const std::wstring& dir, int depth, int& added) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring n = fd.cFileName;
+        if (n == L"." || n == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth < 3 && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) ScanDir(dir + L"\\" + n, depth + 1, added);
+        } else if (n.size() > 4) {
+            std::wstring low = n;
+            for (auto& ch : low) ch = (wchar_t)towlower(ch);
+            if (low.compare(low.size() - 4, 4, L".exe") == 0 && !JunkExe(low) && !InSkipList(low) && (fd.nFileSizeHigh || fd.nFileSizeLow >= 500000))
+                if (AddGameName(low)) ++added;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static std::string ReadBytes(const std::wstring& path) {
+    FILE* f = nullptr;
+    std::string out;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return out;
+    char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0 && out.size() < (4u << 20)) out.append(buf, n);
+    fclose(f);
+    return out;
+}
+static std::wstring Utf8ToW(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+static void ScanSteam(int& added) {   // pastas das bibliotecas Steam -> steamapps\common\<jogo>
+    wchar_t sp[MAX_PATH]; DWORD sz = sizeof(sp);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, nullptr, sp, &sz) != ERROR_SUCCESS) return;
+    std::wstring root = sp;
+    for (auto& c : root) if (c == L'/') c = L'\\';
+    std::vector<std::wstring> libs = {root};
+    std::string vdf = ReadBytes(root + L"\\steamapps\\libraryfolders.vdf");
+    for (size_t pos = 0; (pos = vdf.find("\"path\"", pos)) != std::string::npos;) {
+        pos += 6;
+        size_t q = vdf.find('"', pos);
+        if (q == std::string::npos) break;
+        std::string v;
+        for (++q; q < vdf.size() && vdf[q] != '"'; ++q) { if (vdf[q] == '\\' && q + 1 < vdf.size()) ++q; v += vdf[q]; }
+        pos = q;
+        libs.push_back(Utf8ToW(v));
+    }
+    for (auto& l : libs) {
+        std::wstring common = l + L"\\steamapps\\common";
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((common + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            std::wstring n = fd.cFileName;
+            if (n != L"." && n != L".." && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) ScanDir(common + L"\\" + n, 0, added);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+}
+
+static void ScanEpic(int& added) {   // manifestos do Epic Games Launcher: LaunchExecutable
+    wchar_t pd[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) return;
+    std::wstring dir = std::wstring(pd) + L"\\Epic\\EpicGamesLauncher\\Data\\Manifests";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.item").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::string js = ReadBytes(dir + L"\\" + fd.cFileName);
+        size_t k = js.find("\"LaunchExecutable\"");
+        if (k == std::string::npos) continue;
+        size_t q1 = js.find('"', k + 18);
+        if (q1 == std::string::npos) continue;
+        size_t q2 = js.find('"', q1 + 1);
+        if (q2 == std::string::npos) continue;
+        std::string v = js.substr(q1 + 1, q2 - q1 - 1);
+        for (auto& c : v) if (c == '\\') c = '/';
+        size_t sl = v.find_last_of('/');
+        std::wstring name = Utf8ToW(sl == std::string::npos ? v : v.substr(sl + 1));
+        std::wstring low = name;
+        for (auto& ch : low) ch = (wchar_t)towlower(ch);
+        if (low.size() > 4 && low.compare(low.size() - 4, 4, L".exe") == 0 && AddGameName(low)) ++added;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void ScanGameBar(int& added) {   // jogos que o Xbox Game Bar já reconheceu (HKCU\\System\\GameConfigStore\\Children)
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"System\\GameConfigStore\\Children", 0, KEY_READ, &key) != ERROR_SUCCESS) return;
+    for (DWORD i = 0;; ++i) {
+        wchar_t sub[256]; DWORD n = 256;
+        if (RegEnumKeyExW(key, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        wchar_t path[MAX_PATH] = {}; DWORD sz = sizeof(path);
+        if (RegGetValueW(key, sub, L"MatchedExeFullPath", RRF_RT_REG_SZ, nullptr, path, &sz) != ERROR_SUCCESS) continue;
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) continue;          // jogo movido ou desinstalado
+        std::wstring low = path;
+        for (auto& ch : low) ch = (wchar_t)towlower(ch);
+        if (InWindowsFolder(low)) continue;
+        size_t k = low.find_last_of(L'\\');
+        if (k != std::wstring::npos) low = low.substr(k + 1);
+        if (low.size() > 4 && !JunkExe(low) && !InSkipList(low) && AddGameName(low)) ++added;
+    }
+    RegCloseKey(key);
+}
+
+// ---------------- importação a partir de lançadores (registo, pastas por defeito, manifestos)
+static void ScanInstallPath(std::wstring d, int& added) {   // pasta de instalação (ou o próprio .exe)
+    for (auto& c : d) if (c == L'/') c = L'\\';
+    while (d.size() > 3 && d.back() == L'\\') d.pop_back();
+    if (d.size() >= 2 && d.front() == L'"' && d.back() == L'"') d = d.substr(1, d.size() - 2);
+    DWORD a = GetFileAttributesW(d.c_str());
+    if (a == INVALID_FILE_ATTRIBUTES) return;
+    if (a & FILE_ATTRIBUTE_DIRECTORY) { ScanDir(d, 0, added); return; }
+    std::wstring low = d;
+    for (auto& ch : low) ch = (wchar_t)towlower(ch);
+    size_t k = low.find_last_of(L'\\');
+    if (k != std::wstring::npos) low = low.substr(k + 1);
+    if (low.size() > 4 && low.compare(low.size() - 4, 4, L".exe") == 0 && !JunkExe(low) && !InSkipList(low) && AddGameName(low)) ++added;
+}
+
+// subchaves de `path`, lendo o primeiro valor existente de `valueNames` (vistas de 64 e 32 bits)
+static void ScanRegInstallDirs(HKEY root, const wchar_t* path, std::initializer_list<const wchar_t*> valueNames, int& added) {
+    for (REGSAM view : {KEY_WOW64_64KEY, KEY_WOW64_32KEY}) {
+        HKEY k;
+        if (RegOpenKeyExW(root, path, 0, KEY_READ | view, &k) != ERROR_SUCCESS) continue;
+        for (DWORD i = 0;; ++i) {
+            wchar_t sub[256]; DWORD n = 256;
+            if (RegEnumKeyExW(k, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            HKEY sk;
+            if (RegOpenKeyExW(k, sub, 0, KEY_READ | view, &sk) != ERROR_SUCCESS) continue;
+            for (auto* vn : valueNames) {
+                wchar_t val[MAX_PATH] = {}; DWORD sz = sizeof(val);
+                if (RegGetValueW(sk, nullptr, vn, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, val, &sz) == ERROR_SUCCESS && val[0]) {
+                    ScanInstallPath(val, added);
+                    break;
+                }
+            }
+            RegCloseKey(sk);
+        }
+        RegCloseKey(k);
+    }
+}
+
+static void ScanLauncherRegistry(int& added) {
+    ScanRegInstallDirs(HKEY_LOCAL_MACHINE, L"SOFTWARE\\GOG.com\\Games", {L"exe", L"path"}, added);                    // GOG
+    ScanRegInstallDirs(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Ubisoft\\Launcher\\Installs", {L"InstallDir"}, added);        // Ubisoft Connect
+    ScanRegInstallDirs(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Rockstar Games", {L"InstallFolder"}, added);                  // Rockstar
+    ScanRegInstallDirs(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Electronic Arts", {L"Install Dir", L"InstallDir"}, added);    // EA app / Origin
+    ScanRegInstallDirs(HKEY_LOCAL_MACHINE, L"SOFTWARE\\EA Games", {L"Install Dir", L"InstallDir"}, added);
+    ScanRegInstallDirs(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Bethesda Softworks", {L"Installed Path"}, added);             // Bethesda
+}
+
+// jogos que se registam em "Adicionar/remover programas" com um editor de jogos conhecido (Blizzard / Battle.net, EA, etc.)
+static void ScanUninstall(int& added) {
+    static const wchar_t* pubs[] = {L"blizzard", L"electronic arts", L"ea swiss", L"ubisoft", L"rockstar", L"bethesda", L"riot games",
+        L"cd projekt", L"gog.com", L"2k games", L"take-two", L"square enix", L"sega", L"bandai namco", L"capcom", L"paradox",
+        L"wargaming", L"activision", L"konami", L"warner bros", L"deep silver", L"codemasters", L"io interactive", L"techland",
+        L"devolver", L"team17", L"larian", L"505 games", L"thq nordic", L"kalypso", L"remedy", L"supergiant"};
+    HKEY roots[] = {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER};
+    for (HKEY root : roots) for (REGSAM view : {KEY_WOW64_64KEY, KEY_WOW64_32KEY}) {
+        HKEY k;
+        if (RegOpenKeyExW(root, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", 0, KEY_READ | view, &k) != ERROR_SUCCESS) continue;
+        for (DWORD i = 0;; ++i) {
+            wchar_t sub[256]; DWORD n = 256;
+            if (RegEnumKeyExW(k, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            wchar_t pub[256] = {}; DWORD sz = sizeof(pub);
+            if (RegGetValueW(k, sub, L"Publisher", RRF_RT_REG_SZ, nullptr, pub, &sz) != ERROR_SUCCESS) continue;
+            std::wstring p = pub;
+            for (auto& ch : p) ch = (wchar_t)towlower(ch);
+            bool match = false;
+            for (auto* e : pubs) if (p.find(e) != std::wstring::npos) { match = true; break; }
+            if (!match) continue;
+            wchar_t loc[MAX_PATH] = {}; sz = sizeof(loc);
+            if (RegGetValueW(k, sub, L"InstallLocation", RRF_RT_REG_SZ, nullptr, loc, &sz) == ERROR_SUCCESS && loc[0]) ScanInstallPath(loc, added);
+        }
+        RegCloseKey(k);
+    }
+}
+
+// Xbox / Microsoft Store / Game Pass: pacotes com MicrosoftGame.config (lista os executáveis do jogo)
+static void ScanXboxPackages(int& added) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages",
+                      0, KEY_READ, &k) != ERROR_SUCCESS) return;
+    for (DWORD i = 0;; ++i) {
+        wchar_t sub[512]; DWORD n = 512;
+        if (RegEnumKeyExW(k, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        wchar_t root[MAX_PATH] = {}; DWORD sz = sizeof(root);
+        if (RegGetValueW(k, sub, L"PackageRootFolder", RRF_RT_REG_SZ, nullptr, root, &sz) != ERROR_SUCCESS) continue;
+        std::string cfg = ReadBytes(std::wstring(root) + L"\\MicrosoftGame.config");
+        for (size_t pos = 0; (pos = cfg.find("Executable Name=\"", pos)) != std::string::npos;) {
+            pos += 17;
+            size_t q = cfg.find('"', pos);
+            if (q == std::string::npos) break;
+            std::string v = cfg.substr(pos, q - pos);
+            pos = q;
+            for (auto& c : v) if (c == '\\') c = '/';
+            size_t sl = v.find_last_of('/');
+            std::wstring name = Utf8ToW(sl == std::string::npos ? v : v.substr(sl + 1));
+            std::wstring low = name;
+            for (auto& ch : low) ch = (wchar_t)towlower(ch);
+            if (low.size() > 4 && low.compare(low.size() - 4, 4, L".exe") == 0 && !JunkExe(low) && AddGameName(low)) ++added;
+        }
+    }
+    RegCloseKey(k);
+}
+
+// Riot Games (Valorant, League of Legends...): metadados em ProgramData\Riot Games\Metadata
+static void ScanRiot(int& added) {
+    wchar_t pd[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) return;
+    std::wstring meta = std::wstring(pd) + L"\\Riot Games\\Metadata";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((meta + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring n = fd.cFileName;
+        if (n == L"." || n == L".." || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        WIN32_FIND_DATAW f2;
+        HANDLE h2 = FindFirstFileW((meta + L"\\" + n + L"\\*.yaml").c_str(), &f2);
+        if (h2 == INVALID_HANDLE_VALUE) continue;
+        do {
+            std::string y = ReadBytes(meta + L"\\" + n + L"\\" + f2.cFileName);
+            size_t k = y.find("product_install_full_path:");
+            if (k == std::string::npos) continue;
+            k += 26;
+            while (k < y.size() && (y[k] == ' ' || y[k] == '"' || y[k] == '\'')) ++k;
+            size_t e = k;
+            while (e < y.size() && y[e] != '\r' && y[e] != '\n' && y[e] != '"' && y[e] != '\'') ++e;
+            ScanInstallPath(Utf8ToW(y.substr(k, e - k)), added);
+        } while (FindNextFileW(h2, &f2));
+        FindClose(h2);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// pastas de jogos habituais em cada disco (GOG, Xbox / Game Pass, EA, Ubisoft, Amazon, Rockstar, itch.io, "Games")
+static void ScanRoots(int& added) {
+    static const wchar_t* roots[] = {L"Games", L"GOG Games", L"XboxGames", L"Amazon Games\\Library", L"Program Files\\EA Games",
+        L"Program Files (x86)\\Origin Games", L"Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\games",
+        L"Program Files\\Ubisoft\\Ubisoft Game Launcher\\games", L"Program Files\\Rockstar Games", L"Program Files (x86)\\GOG Galaxy\\Games"};
+    std::vector<std::wstring> dirs;
+    DWORD drives = GetLogicalDrives();
+    for (int d = 0; d < 26; ++d) {
+        if (!(drives & (1u << d))) continue;
+        std::wstring dl = std::wstring(1, (wchar_t)(L'A' + d)) + L":\\";
+        if (GetDriveTypeW(dl.c_str()) != DRIVE_FIXED) continue;
+        for (auto* r : roots) dirs.push_back(dl + r);
+    }
+    wchar_t ad[MAX_PATH];
+    if (GetEnvironmentVariableW(L"APPDATA", ad, MAX_PATH)) dirs.push_back(std::wstring(ad) + L"\\itch\\apps");   // itch.io
+    for (auto& root : dirs) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((root + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            std::wstring n = fd.cFileName;
+            if (n != L"." && n != L".." && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) ScanDir(root + L"\\" + n, 0, added);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+}
+
+static void LibScan() {
+    int added = 0;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    ScanSteam(added);
+    ScanEpic(added);
+    ScanGameBar(added);
+    ScanLauncherRegistry(added);   // GOG, Ubisoft Connect, Rockstar, EA app / Origin, Bethesda
+    ScanUninstall(added);          // Battle.net (Blizzard) e outros editores
+    ScanXboxPackages(added);       // Xbox, Microsoft Store, Game Pass
+    ScanRiot(added);
+    ScanRoots(added);              // pastas habituais, itch.io
+    SetCursor(old);
+    RefreshLibrary();
+    std::wstring msg = std::wstring(TR(S_LIB_ADDED)) + L" " + std::to_wstring(added);
+    MessageBoxW(g_main, msg.c_str(), L"Delquen", MB_ICONINFORMATION);
+}
+
+static void LibScanFolder() {   // jogos sem lançador: escolher a pasta onde estão
+    BROWSEINFOW bi = {};
+    bi.hwndOwner = g_main; bi.lpszTitle = TR(S_LIB_PICK_FOLDER); bi.ulFlags = BIF_RETURNONLYFSDIRS;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return;
+    wchar_t path[MAX_PATH] = {};
+    BOOL ok = SHGetPathFromIDListW(pidl, path);
+    CoTaskMemFree(pidl);
+    if (!ok) return;
+    int added = 0;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    ScanDir(path, 0, added);
+    SetCursor(old);
+    RefreshLibrary();
+    std::wstring msg = std::wstring(TR(S_LIB_ADDED)) + L" " + std::to_wstring(added);
+    MessageBoxW(g_main, msg.c_str(), L"Delquen", MB_ICONINFORMATION);
+}
+
+static void LibAdd() {   // escolher o .exe de um jogo
+    wchar_t file[MAX_PATH] = {};
+    OPENFILENAMEW of = {sizeof(of)};
+    of.hwndOwner = g_main; of.lpstrFilter = L"EXE\0*.exe\0"; of.lpstrFile = file; of.nMaxFile = MAX_PATH;
+    of.lpstrTitle = TR(S_LIB_PICK); of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&of)) return;
+    std::wstring n = file;
+    size_t k = n.find_last_of(L'\\');
+    if (k != std::wstring::npos) n = n.substr(k + 1);
+    AddGameName(n);
+    RefreshLibrary();
+}
+
+static void LibRemove() {
+    HWND lb = Item(4, IDC_GAMELIST);
+    int i = (int)SendMessageW(lb, LB_GETCURSEL, 0, 0);
+    if (i < 0) return;
+    wchar_t buf[512] = {};
+    if (SendMessageW(lb, LB_GETTEXT, i, (LPARAM)buf) <= 0) return;
+    g_include.erase(buf);
+    WritePrivateProfileStringW(L"games", buf, nullptr, g_ini.c_str());
+    RefreshLibrary();
+}
+
 static void OnClick(int id) {
     if (id == IDC_ACTIVE) SetVisible(!g_enabled);
-    else if (id >= IDC_TAB0 && id < IDC_TAB0 + 4) SelectTab(id - IDC_TAB0);
+    else if (id >= IDC_TAB0 && id < IDC_TAB0 + 5) SelectTab(id - IDC_TAB0);
     else if (id == IDC_EDITPOS) ResetPos();
     else if (id == IDC_LOCK) SetLock(!C.lock);
     else if (id == IDC_PROFILE) ProfileToggle();
-    else if (id == IDC_IGNORE) MarkLastFg(false);
-    else if (id == IDC_INCLUDE) MarkLastFg(true);
+    else if (id == IDC_IGNORE) { MarkLastFg(false); RefreshLibrary(); }
+    else if (id == IDC_INCLUDE) { MarkLastFg(true); RefreshLibrary(); }
+    else if (id == IDC_RESETLISTS) { ResetLists(); RefreshLibrary(); }
+    else if (id == IDC_STRICT) { C.strict = !C.strict; SaveCfg(); }
+    else if (id == IDC_LIBADD) LibAdd();
+    else if (id == IDC_LIBREMOVE) LibRemove();
+    else if (id == IDC_LIBSCAN) LibScan();
+    else if (id == IDC_LIBFOLDER) LibScanFolder();
+    else if (id == IDC_BENCH) BenchToggle();
     else if (id == IDC_WINDOWED) { C.windowed = !C.windowed; SaveCfg(); }
     else if (id == IDC_RECORD) { C.record = !C.record; SaveCfg(); }
     else if (id == IDC_OPENDIR) ShellExecuteW(nullptr, L"open", DataDir().c_str(), nullptr, nullptr, SW_SHOW);
@@ -1640,6 +2229,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         SetBkColor(dc, top ? t.bg : t.panel);
         return (LRESULT)(top ? g_brBg : g_brPanel);
     }
+    case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLOREDIT: {
         const Theme& t = TH();
         SetTextColor((HDC)w, t.text); SetBkColor((HDC)w, t.input);
@@ -1682,7 +2272,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     LoadCfg();
     SetUnhandledExceptionFilter(CrashFilter);
     _set_invalid_parameter_handler(InvalidParam);
-    Log(L"=== arranque v2.0, idioma=%d (%ls) ===", g_lang, LANG_NAME[g_lang]);
+    Log(L"=== arranque v2.1, idioma=%d (%ls) ===", g_lang, LANG_NAME[g_lang]);
     { WIN32_FILE_ATTRIBUTE_DATA fa; std::wstring lp = g_ini.substr(0, g_ini.find_last_of(L'\\')) + L"\\debug.log";
       if (GetFileAttributesExW(lp.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 200000) DeleteFileW(lp.c_str()); }
     LoadIgnore();
@@ -1740,6 +2330,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
 
     RegHotkeys();
     RegisterHotKey(g_hwnd, 3, 0, VK_F12);
+    RegisterHotKey(g_hwnd, 4, 0, VK_F8);
     RestartTimer();
     UpdateShown();
     SyncUi();

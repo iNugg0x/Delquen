@@ -16,7 +16,8 @@
 **Overlay**
 - Large, colour-coded **FPS** (good / medium / low thresholds are configurable), plus **average, 1 % low, 0.1 % low** and **frame time**
 - Frame-time graph with **stutter markers**
-- **CPU**, **GPU**, **RAM** and **VRAM** on compact lines; GPU temperature on NVIDIA
+- **CPU**, **GPU**, **RAM** and **VRAM** on compact lines, with **GPU and CPU temperatures** where Windows and the driver provide them
+- **Benchmark mode** (`F8`): measures the game you are playing and shows average, 1 % and 0.1 % low on the overlay, saved to `benchmarks.csv`
 - Truly **transparent background** (per-pixel alpha), no cards; full and compact layouts
 - **Drag to move** with grid and screen-edge snapping; optional click-through lock
 - Size, opacity, background and six sensor colours are all adjustable
@@ -24,6 +25,7 @@
 
 **Games**
 - Detects games automatically (borderless / fullscreen-style windows) and **shows the overlay only while a game is running**
+- **Game library**: a list of the games the overlay is allowed on — add games by hand, import them from **Steam, Epic, GOG, EA app / Origin, Ubisoft Connect, Battle.net, Rockstar, Bethesda, Riot, itch.io, Amazon Games, Xbox / Microsoft Store / Game Pass** and the Xbox Game Bar list, or scan any folder, and optionally switch to *"only games in this list"* mode (works for windowed games too)
 - **Per-game profiles** (position, size, sensors)
 - Include / ignore lists for programs that are wrongly detected (or missed)
 - **Session history**: one CSV per session (FPS, frame time, CPU, GPU, RAM, VRAM) plus a `history.csv` summary (average, 1 % / 0.1 % low, min, max)
@@ -52,17 +54,21 @@ Download `Delquen_Setup.exe` from the **Releases** page and run it. Pick your la
 |---|---|
 | `F10` | Show / hide the overlay |
 | `F9`  | Lock / unlock the position (click-through) |
+| `F8`  | Start / stop a benchmark of the current game |
 | `F12` | Quit |
 
 Shortcuts for the first two can be changed in **Settings**.
 
+### Game library (recommended)
+Open the **Library** tab to see the games Delquen knows. Press **Import installed games** to add your games from Steam, Epic, GOG, EA app / Origin, Ubisoft Connect, Battle.net, Rockstar, Bethesda, Riot, itch.io, Amazon Games, Xbox / Microsoft Store / Game Pass and the Xbox Game Bar list. For games without a launcher use **Scan a folder…**, or **Add game…** to pick one `.exe`. Minecraft Java runs as `javaw.exe`, so add that one by hand. Launchers are detected through their registry entries and default folders, so games in custom locations may need **Scan a folder…**. Turn on **"Only show the overlay for games in this list"** and Delquen will ignore everything else — no false detections, and windowed games work too.
+
 ### Windowed games and wrong detections
-By default only fullscreen / borderless (non-maximised) windows are treated as games, so browsers and other apps are not measured. If you play in a window, enable **Games → "Also detect windowed games"**. If a program is detected by mistake (or missed), switch to it, return to Delquen, open **Games** and press **"Not a game (ignore)"** / **"It's a game (include)"**.
+Without the list mode, by default only fullscreen / borderless (non-maximised) windows are treated as games, so browsers and other apps are not measured. If you play in a window, enable **Games → "Also detect windowed games"**. If a program is detected by mistake (or missed), switch to it, return to Delquen, open **Games** and press **"Not a game (ignore)"** / **"It's a game (include)"**.
 
 ## How it works
 
 - **FPS**: a real-time ETW session listens to `Microsoft-Windows-DXGI` present events (DirectX 9–12) and, as a fallback for OpenGL / Vulkan, a few `Microsoft-Windows-DxgKrnl` present events — the same approach as PresentMon. **Nothing is injected or hooked into the game.**
-- **Hardware**: CPU/RAM via Win32, NVIDIA GPU via NVML, other GPUs via Windows performance counters (PDH) and DXGI.
+- **Hardware**: CPU/RAM via Win32, NVIDIA GPU via NVML, other GPUs via Windows performance counters (PDH) and DXGI. With two GPUs (integrated + dedicated) Delquen follows the busiest one. GPU temperature uses the driver's own performance data (`D3DKMT`); CPU temperature uses the Windows thermal zones.
 - **Overlay**: a layered, topmost, non-activating window drawn with GDI into a 32-bit DIB with per-pixel alpha.
 - Memory footprint is small (an early build measured about 2.7 MB private working set in Task Manager; it grows a little with features).
 
@@ -70,9 +76,9 @@ Although Delquen does not touch game processes, no overlay can be guaranteed to 
 
 ## Known limitations
 
-- **Exclusive fullscreen** (e.g. classic fullscreen in old games such as Minecraft 1.8.8) hides any overlay window. Use borderless / windowed mode.
+- **Exclusive fullscreen** (e.g. classic fullscreen in some games such as Minecraft 1.8.8 or Brawlhalla) hides any overlay window. Delquen detects it and says so in the status line: switch the game to borderless / windowed mode.
 - **OpenGL / Vulkan** support is experimental; some games may show `--` for FPS. Please report them (see Contributing).
-- **CPU temperature** is not available (Windows needs a kernel driver for it). **GPU temperature** is NVIDIA-only. On AMD / Intel only GPU usage (and VRAM when reported) is shown.
+- **CPU temperature** comes from the Windows thermal zones: it can be approximate, or missing on some PCs (reading the real core temperature needs a kernel driver, which Delquen does not use). **GPU temperature** needs driver support.
 - Translations were not reviewed by native speakers — corrections are welcome.
 - Requires **Windows 10 / 11, 64-bit**.
 
@@ -103,6 +109,16 @@ cl /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE delquen.cpp /Fe:delquen.exe 
 
 There are no third-party dependencies. `delquen.cpp` and `lang.inc` must stay in the same folder.
 
+### Automatic builds and releases
+The workflow in `.github/workflows/build.yml` builds the executable and the installer on GitHub for every push. To publish a release, push a version tag:
+
+```bat
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+GitHub then builds `Delquen_Setup.exe` and attaches it to a new Release automatically.
+
 ## Files and data
 
 | Path | Purpose |
@@ -110,6 +126,7 @@ There are no third-party dependencies. `delquen.cpp` and `lang.inc` must stay in
 | `%APPDATA%\Delquen\config.ini` | Settings, per-game profiles (`[game:<exe>]`), include / ignore lists |
 | `%APPDATA%\Delquen\history.csv` | One summary line per game session |
 | `%APPDATA%\Delquen\sessions\*.csv` | Per-second data of each session |
+| `%APPDATA%\Delquen\benchmarks.csv` | One summary line per benchmark (`F8`) |
 | `%APPDATA%\Delquen\debug.log` | Game detection / start-up log (useful for bug reports) |
 
 Older versions used the name *GPAI*; the old `%APPDATA%\GPAI` folder is moved automatically on first start.
@@ -118,7 +135,7 @@ Older versions used the name *GPAI*; the old `%APPDATA%\GPAI` folder is moved au
 
 ```
 delquen.cpp          application (single source file)
-lang.inc             translations (77 phrases x 22 languages)
+lang.inc             translations (88 phrases x 22 languages)
 delquen.rc           Windows resources (icon, version info)
 delquen.ico          application icon (generated, see tools/make_logo.py)
 delquen_setup.iss    Inno Setup installer script
@@ -126,6 +143,7 @@ delquen_wizard.bmp   installer artwork (generated)
 delquen_small.bmp    installer artwork (generated)
 build.bat            build the executable
 build_installer.bat  build the executable and the installer
+.github/workflows/   automatic build (and release on version tags)
 tools/make_logo.py   regenerates the logo, icon, installer art and banners (needs Pillow + numpy)
 docs/                logo.svg, logo.png, banner.png, social-preview.png
 ```

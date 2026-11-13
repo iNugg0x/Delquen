@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [2.1.0] - 2026-11-13
+
+### Added
+- **Benchmark mode** (`F8` or the Games tab): measures the current game, shows `REC` while running and the result (average, 1 % / 0.1 % low) on the overlay afterwards; results are appended to `benchmarks.csv`
+- **GPU readings**: per-adapter usage and VRAM (follows the busiest GPU on laptops with integrated + dedicated graphics), GPU temperature on any vendor through the driver's performance data, and a more robust VRAM-used reading
+- **CPU temperature** from the Windows thermal zones (experimental)
+- **Exclusive fullscreen detection**: Delquen reports it in the status line, because no overlay window can be drawn over an exclusive fullscreen game
+- The overlay re-asserts its "always on top" state regularly, for games that reset it
+- Automatic build and release workflow for GitHub (`.github/workflows/build.yml`)
+
 ## [2.0.0] - 2026-11-06
 
 First public version, released under the name **Delquen** (earlier internal builds were called GPAI).
@@ -12,6 +22,7 @@ First public version, released under the name **Delquen** (earlier internal buil
 - Main window with Overlay, Sensors, Settings and Games tabs; light / dark / system theme
 - Automatic game detection; overlay shown only while a game runs; include / ignore lists
 - Per-game profiles (position, size and sensors)
+- Game library tab: add games manually, import from Steam / Epic, and a list-only detection mode
 - Session recording: per-second CSV per session and a `history.csv` summary
 - DirectX FPS via DXGI; OpenGL / Vulkan via DxgKrnl events (experimental)
 - GPU usage and VRAM on AMD / Intel through Windows counters and DXGI; NVIDIA via NVML

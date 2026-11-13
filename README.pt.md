@@ -16,7 +16,8 @@
 **Overlay**
 - **FPS** grande e com cores por nível (limites configuráveis), mais **média, 1 % Low, 0.1 % Low** e **frame time**
 - Gráfico de frame time com **marcadores de stutter**
-- **CPU**, **GPU**, **RAM** e **VRAM** em linhas compactas; temperatura da GPU em NVIDIA
+- **CPU**, **GPU**, **RAM** e **VRAM** em linhas compactas, com **temperaturas da GPU e da CPU** quando o Windows e o driver as fornecem
+- **Modo benchmark** (`F8`): mede o jogo que estás a jogar e mostra no overlay a média, 1 % e 0.1 % Low, guardados em `benchmarks.csv`
 - **Fundo transparente** a sério (alpha por pixel), sem cartões; modos completo e compacto
 - **Arrastar para mover**, com encaixe numa grelha e nas margens do ecrã; bloqueio opcional (os cliques atravessam)
 - Tamanho, opacidade, fundo e seis cores dos sensores ajustáveis
@@ -24,6 +25,7 @@
 
 **Jogos**
 - Deteta jogos automaticamente (janelas em ecrã inteiro/borderless) e **só mostra o overlay enquanto há um jogo**
+- **Biblioteca de jogos**: lista dos jogos em que o overlay pode aparecer — adiciona jogos à mão, importa do **Steam, Epic, GOG, EA app / Origin, Ubisoft Connect, Battle.net, Rockstar, Bethesda, Riot, itch.io, Amazon Games, Xbox / Microsoft Store / Game Pass** e da lista do Xbox Game Bar, ou procura numa pasta qualquer, e liga o modo *"só jogos desta lista"* (funciona também em janela)
 - **Perfis por jogo** (posição, tamanho, sensores)
 - Listas de incluir/ignorar para programas detetados por engano (ou não detetados)
 - **Histórico de sessões**: um CSV por sessão (FPS, frame time, CPU, GPU, RAM, VRAM) e um `history.csv` com o resumo (média, 1 % / 0.1 % Low, mínimo, máximo)
@@ -52,17 +54,21 @@ Descarrega o `Delquen_Setup.exe` na página **Releases** e executa-o. Escolhe o 
 |---|---|
 | `F10` | Mostrar / esconder o overlay |
 | `F9`  | Bloquear / desbloquear a posição (cliques atravessam) |
+| `F8`  | Iniciar / parar um benchmark do jogo atual |
 | `F12` | Sair |
 
 Os dois primeiros podem ser alterados em **Definições**.
 
+### Biblioteca de jogos (recomendado)
+Abre o separador **Biblioteca** para veres os jogos que o Delquen conhece. Carrega em **Importar jogos instalados** para juntar os jogos do Steam, Epic, GOG, EA app / Origin, Ubisoft Connect, Battle.net, Rockstar, Bethesda, Riot, itch.io, Amazon Games, Xbox / Microsoft Store / Game Pass e da lista do Xbox Game Bar. Para jogos sem lançador usa **Procurar numa pasta…**, ou **Adicionar jogo…** para escolher um `.exe`. O Minecraft Java corre como `javaw.exe`, por isso adiciona esse à mão. Os lançadores são encontrados pelo registo e pelas pastas por defeito, por isso jogos em locais personalizados podem precisar de **Procurar numa pasta…**. Liga **"Mostrar o overlay só nos jogos desta lista"** e o Delquen ignora tudo o resto — sem deteções erradas, e os jogos em janela também funcionam.
+
 ### Jogos em janela e deteções erradas
-Por defeito só janelas em ecrã inteiro / borderless (não maximizadas) são tratadas como jogos, para não medir navegadores e outras apps. Se jogas em janela, ativa **Jogos → "Detetar também jogos em janela"**. Se um programa for detetado por engano (ou ignorado), passa para ele, volta ao Delquen, abre **Jogos** e carrega em **"Não é um jogo (ignorar)"** / **"É um jogo (incluir)"**.
+Sem o modo de lista, por defeito só janelas em ecrã inteiro / borderless (não maximizadas) são tratadas como jogos, para não medir navegadores e outras apps. Se jogas em janela, ativa **Jogos → "Detetar também jogos em janela"**. Se um programa for detetado por engano (ou ignorado), passa para ele, volta ao Delquen, abre **Jogos** e carrega em **"Não é um jogo (ignorar)"** / **"É um jogo (incluir)"**.
 
 ## Como funciona
 
 - **FPS**: uma sessão ETW em tempo real escuta os eventos de apresentação do `Microsoft-Windows-DXGI` (DirectX 9–12) e, como alternativa para OpenGL / Vulkan, alguns eventos `Microsoft-Windows-DxgKrnl` — a mesma abordagem do PresentMon. **Nada é injetado nem intercetado nos jogos.**
-- **Hardware**: CPU/RAM via Win32, GPU NVIDIA via NVML, outras GPUs via contadores de desempenho do Windows (PDH) e DXGI.
+- **Hardware**: CPU/RAM via Win32, GPU NVIDIA via NVML, outras GPUs via contadores de desempenho do Windows (PDH) e DXGI. Com duas GPUs (integrada + dedicada) o Delquen segue a mais ocupada. A temperatura da GPU usa os dados de desempenho do próprio driver (`D3DKMT`); a da CPU usa as zonas térmicas do Windows.
 - **Overlay**: janela em camadas, sempre no topo e sem tirar o foco, desenhada com GDI num DIB de 32 bits com alpha por pixel.
 - A pegada de memória é pequena (uma versão inicial mediu cerca de 2,7 MB de conjunto de trabalho privado no Gestor de Tarefas; cresce um pouco com as funcionalidades).
 
@@ -70,9 +76,9 @@ Embora o Delquen não toque nos processos dos jogos, nenhum overlay pode garanti
 
 ## Limitações conhecidas
 
-- O **ecrã inteiro exclusivo** (por exemplo o ecrã inteiro clássico de jogos antigos como o Minecraft 1.8.8) esconde qualquer janela de overlay. Usa modo borderless ou janela.
+- O **ecrã inteiro exclusivo** (por exemplo o ecrã inteiro clássico de alguns jogos como o Minecraft 1.8.8 ou o Brawlhalla) esconde qualquer janela de overlay. O Delquen deteta-o e avisa na linha de estado: passa o jogo para borderless / janela.
 - O suporte a **OpenGL / Vulkan** é experimental; alguns jogos podem mostrar `--` no FPS. Reporta-os (ver Contribuir).
-- A **temperatura da CPU** não está disponível (o Windows precisa de um driver de kernel). A **temperatura da GPU** só existe em NVIDIA. Em AMD / Intel mostra-se a utilização da GPU (e a VRAM quando disponível).
+- A **temperatura da CPU** vem das zonas térmicas do Windows: pode ser aproximada, ou não existir em alguns PCs (ler a temperatura real dos núcleos exige um driver de kernel, que o Delquen não usa). A **temperatura da GPU** depende do driver.
 - As traduções não foram revistas por falantes nativos — correções são bem-vindas.
 - Requer **Windows 10 / 11 de 64 bits**.
 
@@ -103,6 +109,16 @@ cl /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE delquen.cpp /Fe:delquen.exe 
 
 Não há dependências de terceiros. O `delquen.cpp` e o `lang.inc` têm de estar na mesma pasta.
 
+### Compilações e releases automáticas
+O fluxo em `.github/workflows/build.yml` compila o executável e o instalador no GitHub a cada envio. Para publicar uma release, envia uma etiqueta de versão:
+
+```bat
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+O GitHub compila então o `Delquen_Setup.exe` e junta-o a uma nova Release automaticamente.
+
 ## Ficheiros e dados
 
 | Caminho | Função |
@@ -110,6 +126,7 @@ Não há dependências de terceiros. O `delquen.cpp` e o `lang.inc` têm de esta
 | `%APPDATA%\Delquen\config.ini` | Definições, perfis por jogo (`[game:<exe>]`), listas de incluir / ignorar |
 | `%APPDATA%\Delquen\history.csv` | Uma linha de resumo por sessão de jogo |
 | `%APPDATA%\Delquen\sessions\*.csv` | Dados por segundo de cada sessão |
+| `%APPDATA%\Delquen\benchmarks.csv` | Uma linha de resumo por benchmark (`F8`) |
 | `%APPDATA%\Delquen\debug.log` | Registo de deteção de jogos / arranque (útil em relatórios de erros) |
 
 As versões antigas chamavam-se *GPAI*; a pasta antiga `%APPDATA%\GPAI` é movida automaticamente no primeiro arranque.
@@ -118,7 +135,7 @@ As versões antigas chamavam-se *GPAI*; a pasta antiga `%APPDATA%\GPAI` é movid
 
 ```
 delquen.cpp          aplicação (um único ficheiro de código)
-lang.inc             traduções (77 frases x 22 idiomas)
+lang.inc             traduções (88 frases x 22 idiomas)
 delquen.rc           recursos do Windows (ícone, versão)
 delquen.ico          ícone da aplicação (gerado, ver tools/make_logo.py)
 delquen_setup.iss    script do instalador (Inno Setup)
@@ -126,6 +143,7 @@ delquen_wizard.bmp   imagens do instalador (geradas)
 delquen_small.bmp    imagens do instalador (geradas)
 build.bat            compila o executável
 build_installer.bat  compila o executável e o instalador
+.github/workflows/   compilação automática (e release nas etiquetas de versão)
 tools/make_logo.py   regenera o logo, o ícone, as imagens do instalador e os banners (precisa de Pillow + numpy)
 docs/                logo.svg, logo.png, banner.png, social-preview.png
 ```
